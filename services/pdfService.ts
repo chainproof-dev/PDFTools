@@ -570,17 +570,237 @@ export const generatePreviewPair = async (file: File, config: AdaptiveConfig) =>
   };
 };
 
+// --- ADVANCED COMPRESSION UTILITIES ---
+
+interface PageAnalysis {
+  pageIndex: number;
+  hasImages: boolean;
+  imageCount: number;
+  textDensity: number;
+  complexity: 'simple' | 'medium' | 'complex';
+  recommendedStrategy: 'vector' | 'hybrid' | 'raster';
+}
+
+const analyzePageContent = async (page: any): Promise<PageAnalysis> => {
+  const textContent = await page.getTextContent();
+  const ops = await page.getOperatorList();
+
+  let imageCount = 0;
+  for (let i = 0; i < ops.fnArray.length; i++) {
+    if (ops.fnArray[i] === pdfjs.OPS.paintImageXObject ||
+        ops.fnArray[i] === pdfjs.OPS.paintInlineImageXObject ||
+        ops.fnArray[i] === pdfjs.OPS.paintImageMaskXObject) {
+      imageCount++;
+    }
+  }
+
+  const textDensity = textContent.items.length;
+  const hasImages = imageCount > 0;
+
+  let complexity: 'simple' | 'medium' | 'complex' = 'simple';
+  if (imageCount > 5 || textDensity > 100) complexity = 'medium';
+  if (imageCount > 15 || textDensity > 300) complexity = 'complex';
+
+  let recommendedStrategy: 'vector' | 'hybrid' | 'raster' = 'vector';
+  if (imageCount > textDensity * 0.5) recommendedStrategy = 'hybrid';
+  if (imageCount > 20 && textDensity < 10) recommendedStrategy = 'raster';
+
+  return {
+    pageIndex: page.pageNumber - 1,
+    hasImages,
+    imageCount,
+    textDensity,
+    complexity,
+    recommendedStrategy
+  };
+};
+
+const generateImageHash = async (imageData: Uint8ClampedArray, sampleSize: number = 1024): Promise<string> => {
+  const sample = [];
+  const step = Math.max(1, Math.floor(imageData.length / sampleSize));
+
+  for (let i = 0; i < imageData.length && sample.length < sampleSize; i += step) {
+    sample.push(imageData[i]);
+  }
+
+  return sample.join('-');
+};
+
+const downsampleImage = async (
+  canvas: HTMLCanvasElement,
+  targetDPI: number,
+  currentDPI: number = 150
+): Promise<HTMLCanvasElement> => {
+  if (targetDPI >= currentDPI) return canvas;
+
+  const scale = targetDPI / currentDPI;
+  const newWidth = Math.max(1, Math.floor(canvas.width * scale));
+  const newHeight = Math.max(1, Math.floor(canvas.height * scale));
+
+  const offscreen = document.createElement('canvas');
+  offscreen.width = newWidth;
+  offscreen.height = newHeight;
+
+  const ctx = offscreen.getContext('2d');
+  if (!ctx) return canvas;
+
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(canvas, 0, 0, newWidth, newHeight);
+
+  return offscreen;
+};
+
+const optimizeImageQuality = async (
+  canvas: HTMLCanvasElement,
+  quality: number,
+  format: 'jpeg' | 'png' = 'jpeg'
+): Promise<{ data: ArrayBuffer; size: number }> => {
+  const mimeType = format === 'jpeg' ? 'image/jpeg' : 'image/png';
+  const dataUrl = canvas.toDataURL(mimeType, quality);
+  const response = await fetch(dataUrl);
+  const data = await response.arrayBuffer();
+
+  return { data, size: data.byteLength };
+};
+
+const applyMultiPassCompression = async (
+  canvas: HTMLCanvasElement,
+  targetQuality: number
+): Promise<{ data: ArrayBuffer; quality: number; size: number }> => {
+  const passes = [targetQuality, targetQuality * 0.9, targetQuality * 0.8, targetQuality * 0.7];
+  let bestResult = await optimizeImageQuality(canvas, passes[0], 'jpeg');
+  let bestQuality = passes[0];
+
+  for (const q of passes.slice(1)) {
+    const result = await optimizeImageQuality(canvas, q, 'jpeg');
+    if (result.size < bestResult.size * 0.95) {
+      bestResult = result;
+      bestQuality = q;
+    }
+  }
+
+  return { ...bestResult, quality: bestQuality };
+};
+
+const processPageWithSmartCompression = async (
+  page: any,
+  analysis: PageAnalysis,
+  config: AdaptiveConfig,
+  deduplicationMap: Map<string, { data: ArrayBuffer; embedded?: any }>
+): Promise<{ canvas: HTMLCanvasElement; hash: string; strategy: string; stats: any }> => {
+  const stats = {
+    imagesDetected: analysis.imageCount,
+    imagesDuplicated: 0,
+    originalDPI: 150,
+    targetDPI: config.projectedDPI,
+    compressionApplied: 'none'
+  };
+
+  let renderScale = config.projectedDPI / 72;
+
+  if (analysis.recommendedStrategy === 'vector' && analysis.textDensity > 50) {
+    renderScale = Math.max(2.0, renderScale);
+    stats.compressionApplied = 'text-optimized';
+  } else if (analysis.hasImages) {
+    renderScale = Math.min(2.5, Math.max(1.5, renderScale));
+    stats.compressionApplied = 'image-optimized';
+  }
+
+  const viewport = page.getViewport({ scale: renderScale });
+  const canvas = document.createElement('canvas');
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Canvas context failed');
+
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  await page.render({ canvasContext: ctx, viewport }).promise;
+
+  let processedCanvas = canvas;
+
+  if (config.projectedDPI < 150 && analysis.hasImages) {
+    processedCanvas = await downsampleImage(canvas, config.projectedDPI, 150);
+    stats.compressionApplied = 'downsampled';
+  }
+
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const hash = await generateImageHash(imageData.data);
+
+  if (deduplicationMap.has(hash)) {
+    stats.imagesDuplicated = 1;
+  } else {
+    const optimized = await applyMultiPassCompression(processedCanvas, config.quality);
+    deduplicationMap.set(hash, { data: optimized.data });
+  }
+
+  return {
+    canvas: processedCanvas,
+    hash,
+    strategy: analysis.recommendedStrategy,
+    stats
+  };
+};
+
+const rebuildPDFWithObjectStreams = async (
+  processedPages: Array<{
+    canvas: HTMLCanvasElement;
+    width: number;
+    height: number;
+    hash: string;
+  }>,
+  quality: number,
+  deduplicationMap: Map<string, { data: ArrayBuffer; embedded?: any }>
+): Promise<Uint8Array> => {
+  const newPdf = await PDFDocument.create();
+
+  for (const pageData of processedPages) {
+    let embeddedImage = deduplicationMap.get(pageData.hash)?.embedded;
+
+    if (!embeddedImage) {
+      let imageBytes: ArrayBuffer;
+
+      if (deduplicationMap.has(pageData.hash)) {
+        imageBytes = deduplicationMap.get(pageData.hash)!.data;
+      } else {
+        const imageDataUrl = pageData.canvas.toDataURL('image/jpeg', quality);
+        imageBytes = await fetch(imageDataUrl).then(r => r.arrayBuffer());
+      }
+
+      embeddedImage = await newPdf.embedJpg(imageBytes);
+
+      if (deduplicationMap.has(pageData.hash)) {
+        deduplicationMap.get(pageData.hash)!.embedded = embeddedImage;
+      }
+    }
+
+    const page = newPdf.addPage([pageData.width, pageData.height]);
+    page.drawImage(embeddedImage, {
+      x: 0,
+      y: 0,
+      width: pageData.width,
+      height: pageData.height
+    });
+  }
+
+  return newPdf.save({
+    useObjectStreams: true,
+    addDefaultPage: false,
+    objectsPerTick: 50
+  });
+};
+
 export const compressPDFAdaptive = async (
-  file: File, 
-  level: CompressionLevel, 
+  file: File,
+  level: CompressionLevel,
   onProgress: (p: number) => void,
   overrideSafety: boolean = false,
   customConfig?: AdaptiveConfig
 ) => {
   const config = customConfig || getAdaptiveConfig(level, false);
-  
-  // Implemented safety check to match usage in CompressPDF.tsx
-  // This avoids processing if DPI is too low, unless safety is overridden
+
   if (!overrideSafety && config.projectedDPI < 72) {
       return {
           data: new Uint8Array(0),
@@ -596,43 +816,100 @@ export const compressPDFAdaptive = async (
   const arrayBuffer = await readFileAsArrayBuffer(file);
   const pdf = await pdfjs.getDocument(getSafeBuffer(arrayBuffer)).promise;
   const numPages = pdf.numPages;
-  const newPdf = await PDFDocument.create();
+
+  onProgress(5);
+
+  const pageAnalyses: PageAnalysis[] = [];
+  const maxAnalysisPages = Math.min(numPages, 5);
+
+  for (let i = 1; i <= maxAnalysisPages; i++) {
+    const page = await pdf.getPage(i);
+    const analysis = await analyzePageContent(page);
+    pageAnalyses.push(analysis);
+  }
+
+  onProgress(10);
+
+  const avgTextDensity = pageAnalyses.reduce((sum, a) => sum + a.textDensity, 0) / pageAnalyses.length;
+  const avgImageCount = pageAnalyses.reduce((sum, a) => sum + a.imageCount, 0) / pageAnalyses.length;
+  const totalImages = pageAnalyses.reduce((sum, a) => sum + a.imageCount, 0);
+  const isTextHeavy = avgTextDensity > avgImageCount * 2;
+
+  const deduplicationMap = new Map<string, { data: ArrayBuffer; embedded?: any }>();
+  const processedPages: Array<{
+    canvas: HTMLCanvasElement;
+    width: number;
+    height: number;
+    hash: string;
+  }> = [];
+
+  let totalImagesDetected = 0;
+  let totalImagesDeduplicated = 0;
+  let strategyUsed = 'Smart Hybrid Compression';
 
   for (let i = 1; i <= numPages; i++) {
-    onProgress((i / numPages) * 90);
+    onProgress(10 + (i / numPages) * 70);
+
     const page = await pdf.getPage(i);
-    const vp = page.getViewport({ scale: config.scale * 1.5 });
-    const canvas = document.createElement('canvas');
-    canvas.width = vp.width;
-    canvas.height = vp.height;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) continue;
-    ctx.fillStyle = 'white';
-    ctx.fillRect(0,0, canvas.width, canvas.height);
-    await page.render({ canvasContext: ctx, viewport: vp }).promise;
-    
-    const imgData = canvas.toDataURL('image/jpeg', config.quality);
-    const imgBytes = await fetch(imgData).then(r => r.arrayBuffer());
-    
-    const embed = await newPdf.embedJpg(imgBytes);
-    
+    let analysis: PageAnalysis;
+
+    if (i <= maxAnalysisPages) {
+      analysis = pageAnalyses[i - 1];
+    } else {
+      analysis = {
+        pageIndex: i - 1,
+        hasImages: avgImageCount > 0,
+        imageCount: Math.round(avgImageCount),
+        textDensity: Math.round(avgTextDensity),
+        complexity: avgTextDensity > 100 ? 'medium' : 'simple',
+        recommendedStrategy: isTextHeavy ? 'vector' : 'hybrid'
+      };
+    }
+
+    const result = await processPageWithSmartCompression(page, analysis, config, deduplicationMap);
+
+    totalImagesDetected += result.stats.imagesDetected;
+    totalImagesDeduplicated += result.stats.imagesDuplicated;
+
+    if (analysis.hasImages) {
+      strategyUsed = `Image Optimization (${result.stats.compressionApplied})`;
+    } else if (isTextHeavy) {
+      strategyUsed = 'Text-Heavy Optimization';
+    }
+
     const origVp = page.getViewport({ scale: 1.0 });
-    const p = newPdf.addPage([origVp.width, origVp.height]);
-    p.drawImage(embed, {
-        x: 0, 
-        y: 0,
-        width: origVp.width,
-        height: origVp.height
+    processedPages.push({
+      canvas: result.canvas,
+      width: origVp.width,
+      height: origVp.height,
+      hash: result.hash
     });
   }
 
-  const saved = await newPdf.save();
+  onProgress(85);
+
+  const saved = await rebuildPDFWithObjectStreams(
+    processedPages,
+    config.quality,
+    deduplicationMap
+  );
+
+  onProgress(95);
+
+  const dedupPercentage = totalImagesDetected > 0
+    ? Math.round((totalImagesDeduplicated / totalImagesDetected) * 100)
+    : 0;
+
+  const compressionRatio = Math.round((1 - saved.byteLength / file.size) * 100);
+
   return {
      data: saved,
      meta: {
         compressedSize: saved.byteLength,
         projectedDPI: config.projectedDPI,
-        strategyUsed: 'Adaptive Rasterization'
+        strategyUsed: `${strategyUsed} | ${totalImages} images | ${dedupPercentage}% deduped | ${compressionRatio}% reduction`,
+        imagesProcessed: totalImagesDetected,
+        imagesDeduplicated: totalImagesDeduplicated
      },
      status: 'success' as const
   };
